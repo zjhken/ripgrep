@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use clap;
 use encoding_rs::Encoding;
 use grep::{Grep, GrepBuilder};
+use grep_printer;
+use grep_regex;
+use grep_searcher;
 use log;
 use num_cpus;
 use regex;
@@ -57,11 +60,13 @@ pub struct Args {
     invert_match: bool,
     line_number: bool,
     line_per_match: bool,
+    matcher: grep_regex::RegexMatcher,
     max_columns: Option<usize>,
     max_count: Option<u64>,
     max_depth: Option<usize>,
     max_filesize: Option<u64>,
     mmap: bool,
+    multiline: bool,
     no_ignore: bool,
     no_ignore_global: bool,
     no_ignore_messages: bool,
@@ -83,7 +88,8 @@ pub struct Args {
     with_filename: bool,
     search_zip_files: bool,
     preprocessor: Option<PathBuf>,
-    stats: bool
+    stats: bool,
+    user_color_specs: Vec<grep_printer::UserColorSpec>,
 }
 
 impl Args {
@@ -198,6 +204,48 @@ impl Args {
             p = p.replace(rep.clone());
         }
         p
+    }
+
+    /// Create a new printer of individual search results that writes to the
+    /// writer given.
+    pub fn printer2<W: termcolor::WriteColor>(
+        &self,
+        wtr: W,
+    ) -> grep_printer::Standard<W> {
+        grep_printer::StandardBuilder::new()
+            .user_color_specs(&self.user_color_specs)
+            .heading(self.heading)
+            .only_matching(self.only_matching)
+            .line_per_match(self.line_per_match)
+            .replacement(self.replace.clone())
+            .max_columns(self.max_columns.map(|n| n as u64))
+            .column(self.column)
+            .byte_offset(self.byte_offset)
+            .separator_context(Some(self.context_separator.clone()))
+            .separator_path(self.path_separator)
+            .path_terminator(if self.null { Some(b'\x00') } else { None })
+            .build(wtr)
+    }
+
+    pub fn searcher2(&self) -> Result<grep_searcher::Searcher> {
+        let mut builder = grep_searcher::SearcherBuilder::new();
+        builder
+            .invert_match(self.invert_match)
+            .line_number(self.line_number)
+            .multi_line(self.multiline)
+            .after_context(self.after_context)
+            .before_context(self.before_context)
+            .memory_map(grep_searcher::MmapChoice::never());
+        if !self.text {
+            builder.binary_detection(
+                grep_searcher::BinaryDetection::quit(b'\x00')
+            );
+        }
+        Ok(builder.build()?)
+    }
+
+    pub fn matcher2(&self) -> grep_regex::RegexMatcher {
+        self.matcher.clone()
     }
 
     /// Retrieve the configured file separator.
@@ -386,6 +434,7 @@ impl<'a> ArgMatches<'a> {
         let (count, count_matches) = self.counts();
         let quiet = self.is_present("quiet");
         let (grep, can_match) = self.grep()?;
+        let (matcher2, _) = self.matcher2()?;
         let args = Args {
             paths: paths,
             after_context: after_context,
@@ -412,11 +461,13 @@ impl<'a> ArgMatches<'a> {
             invert_match: self.is_present("invert-match"),
             line_number: line_number,
             line_per_match: self.is_present("vimgrep"),
+            matcher: matcher2,
             max_columns: self.usize_of_nonzero("max-columns")?,
             max_count: self.usize_of("max-count")?.map(|n| n as u64),
             max_depth: self.usize_of("max-depth")?,
             max_filesize: self.max_filesize()?,
             mmap: mmap,
+            multiline: self.is_present("multiline"),
             no_ignore: self.no_ignore(),
             no_ignore_global: self.no_ignore_global(),
             no_ignore_messages: self.is_present("no-ignore-messages"),
@@ -438,7 +489,8 @@ impl<'a> ArgMatches<'a> {
             with_filename: with_filename,
             search_zip_files: self.is_present("search-zip"),
             preprocessor: self.preprocessor(),
-            stats: self.stats()
+            stats: self.stats(),
+            user_color_specs: self.user_color_specs()?,
         };
         if args.mmap {
             debug!("will try to use memory maps");
@@ -583,7 +635,8 @@ impl<'a> ArgMatches<'a> {
     /// flag is set. Otherwise, the pattern is returned unchanged.
     fn word_pattern(&self, pat: String) -> String {
         if self.is_present("word-regexp") {
-            format!(r"\b(?:{})\b", pat)
+            pat
+            // format!(r"\b(?:{})\b", pat)
         } else {
             pat
         }
@@ -837,6 +890,23 @@ impl<'a> ArgMatches<'a> {
         Ok(ColorSpecs::new(&specs))
     }
 
+    fn user_color_specs(&self) -> Result<Vec<grep_printer::UserColorSpec>> {
+        // Start with a default set of color specs.
+        let mut specs = vec![
+            #[cfg(unix)]
+            "path:fg:magenta".parse().unwrap(),
+            #[cfg(windows)]
+            "path:fg:cyan".parse().unwrap(),
+            "line:fg:green".parse().unwrap(),
+            "match:fg:red".parse().unwrap(),
+            "match:style:bold".parse().unwrap(),
+        ];
+        for spec_str in self.values_of_lossy_vec("colors") {
+            specs.push(spec_str.parse()?);
+        }
+        Ok(specs)
+    }
+
     /// Return the text encoding specified.
     ///
     /// If the label given by the caller doesn't correspond to a valid
@@ -884,6 +954,38 @@ impl<'a> ArgMatches<'a> {
         } else {
             threads
         })
+    }
+
+    fn matcher2(&self) -> Result<(grep_regex::RegexMatcher, bool)> {
+        let smart =
+            self.is_present("smart-case")
+            && !self.is_present("ignore-case")
+            && !self.is_present("case-sensitive");
+        let casei =
+            self.is_present("ignore-case")
+            && !self.is_present("case-sensitive");
+
+        let mut builder = grep_regex::RegexMatcherBuilder::new();
+        builder
+            .case_insensitive(casei)
+            .case_smart(smart)
+            .multi_line(true);
+        if !self.is_present("multiline") {
+            builder.line_terminator(Some(b'\n'));
+        }
+        if self.is_present("word-regexp") {
+            builder.word(true);
+        }
+        if let Some(limit) = self.dfa_size_limit()? {
+            builder.dfa_size_limit(limit);
+        }
+        if let Some(limit) = self.regex_size_limit()? {
+            builder.size_limit(limit);
+        }
+
+        let pats = self.patterns()?;
+        let ok = !pats.is_empty();
+        Ok((builder.build(&pats.join("|"))?, ok))
     }
 
     /// Builds a grep matcher from the command line flags.
